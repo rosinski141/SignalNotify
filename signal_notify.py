@@ -74,6 +74,7 @@ class Signal:
     initial_price: Optional[float] = None  # Price when signal was created
     pip_size: float = 0.0001  # Will be set from MT5 symbol info
     notified_milestones: Set[int] = field(default_factory=set)  # Pip milestones already sent
+    previous_price: Optional[float] = None  # Last checked price for crossing detection
     created_at: float = field(default_factory=time.time)
 
     @property
@@ -483,14 +484,21 @@ class SignalMonitor:
                             sig, bid, milestone, pips
                         )
 
-                # ── Hit check ──
+                # ── Hit check (crossing detection) ──
+                # Only fire when price actually crosses through or touches
+                # the target level between ticks, regardless of direction.
                 hit = False
-                if sig.initial_price < target:
-                    hit = bid >= target
-                elif sig.initial_price > target:
-                    hit = bid <= target
+                if sig.previous_price is None:
+                    # First price check — just set baseline
+                    sig.previous_price = bid
+                    # Only fire if price is already at target (within 1 pip)
+                    if abs(bid - target) <= sig.pip_size:
+                        hit = True
                 else:
-                    hit = True
+                    lo = min(sig.previous_price, bid)
+                    hi = max(sig.previous_price, bid)
+                    hit = lo <= target <= hi
+                    sig.previous_price = bid
 
                 if hit:
                     log.info(
