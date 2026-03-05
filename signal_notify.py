@@ -40,6 +40,8 @@ MT5_PATH = os.getenv("MT5_PATH", "")
 
 PRICE_CHECK_INTERVAL = float(os.getenv("PRICE_CHECK_INTERVAL", "1"))
 MESSAGE_CHECK_INTERVAL = float(os.getenv("MESSAGE_CHECK_INTERVAL", "30"))
+SIGNAL_MAX_AGE = float(os.getenv("SIGNAL_MAX_AGE", str(24 * 60 * 60)))  # 24 hours
+EXPIRY_CHECK_INTERVAL = float(os.getenv("EXPIRY_CHECK_INTERVAL", "60"))  # check every minute
 
 # ── Signal pattern ───────────────────────────────────────────────────────────
 # Matches patterns like:  GOLD@5000  |  EURUSD@1.08550  |  XAUUSD @ 2050.50
@@ -411,6 +413,31 @@ class SignalMonitor:
         except Exception as exc:
             log.error("Failed to send proximity alert: %s", exc)
 
+    # ── Expiry ───────────────────────────────────────────────────────────
+
+    async def _send_expiry_notification(self, signal: Signal) -> None:
+        """Send a Telegram message when a signal is removed due to 24h expiry."""
+        if not self.client:
+            return
+        age_hours = (time.time() - signal.created_at) / 3600
+        text = (
+            f"⏰ **Signal expired (24h)**\n\n"
+            f"**Symbol:** {signal.symbol}\n"
+            f"**Target:** {signal.target_price}\n"
+            f"**Age:** {age_hours:.1f} hours\n"
+            f"**Original signal:** `{signal.raw_text}`"
+        )
+        try:
+            await self.client.send_message(signal.channel_id, text, parse_mode="md")
+            log.info(
+                "Expiry notification sent for %s @ %.5f → channel %s",
+                signal.symbol,
+                signal.target_price,
+                signal.channel_id,
+            )
+        except Exception as exc:
+            log.error("Failed to send expiry notification: %s", exc)
+
     # ── Message-still-exists check ───────────────────────────────────────
 
     async def _verify_messages_exist(self) -> None:
@@ -520,6 +547,27 @@ class SignalMonitor:
             await asyncio.sleep(MESSAGE_CHECK_INTERVAL)
             await self._verify_messages_exist()
 
+    async def _expiry_loop(self) -> None:
+        """Remove signals that have been active for more than SIGNAL_MAX_AGE."""
+        while self._running:
+            await asyncio.sleep(EXPIRY_CHECK_INTERVAL)
+            now = time.time()
+            expired_keys = [
+                key
+                for key, sig in self.active_signals.items()
+                if now - sig.created_at >= SIGNAL_MAX_AGE
+            ]
+            for key in expired_keys:
+                sig = self.active_signals.pop(key)
+                log.info(
+                    "SIGNAL EXPIRED (24h): %s @ %.5f  (channel=%s msg=%s)",
+                    sig.symbol,
+                    sig.target_price,
+                    sig.channel_id,
+                    sig.message_id,
+                )
+                await self._send_expiry_notification(sig)
+
     async def _status_loop(self) -> None:
         """Log active signals count periodically."""
         while self._running:
@@ -557,6 +605,7 @@ class SignalMonitor:
             await asyncio.gather(
                 self._price_loop(),
                 self._message_check_loop(),
+                self._expiry_loop(),
                 self._status_loop(),
                 self.client.run_until_disconnected(),
             )
