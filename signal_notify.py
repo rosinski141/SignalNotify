@@ -42,6 +42,8 @@ PRICE_CHECK_INTERVAL = float(os.getenv("PRICE_CHECK_INTERVAL", "1"))
 MESSAGE_CHECK_INTERVAL = float(os.getenv("MESSAGE_CHECK_INTERVAL", "30"))
 SIGNAL_MAX_AGE = float(os.getenv("SIGNAL_MAX_AGE", str(24 * 60 * 60)))  # 24 hours
 EXPIRY_CHECK_INTERVAL = float(os.getenv("EXPIRY_CHECK_INTERVAL", "60"))  # check every minute
+RECONNECT_BASE_DELAY = float(os.getenv("RECONNECT_BASE_DELAY", "10"))  # initial delay before reconnect
+RECONNECT_MAX_DELAY = float(os.getenv("RECONNECT_MAX_DELAY", "300"))  # max delay between reconnects
 
 # ── Signal pattern ───────────────────────────────────────────────────────────
 # Matches patterns like:  GOLD@5000  |  EURUSD@1.08550  |  XAUUSD @ 2050.50
@@ -98,6 +100,8 @@ class SignalMonitor:
         self._running = False
         self._resolved_channels: Dict[str, int] = {}
         self._symbol_cache: Dict[str, str] = {}  # requested name → actual MT5 name
+        self._mt5_consecutive_failures = 0
+        self._mt5_connected = False
 
     # ── MT5 ──────────────────────────────────────────────────────────────
 
@@ -114,12 +118,41 @@ class SignalMonitor:
         info = mt5.account_info()
         if info:
             log.info(
-                "MT5 connected – Account: %s  Server: %s  Balance: %.2f",
+                "MT5 connected \u2013 Account: %s  Server: %s  Balance: %.2f",
                 info.login,
                 info.server,
                 info.balance,
             )
         return True
+
+    def reconnect_mt5(self) -> bool:
+        """Attempt to re-establish the MT5 connection."""
+        log.info("Attempting MT5 reconnection\u2026")
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        if self.init_mt5():
+            self._mt5_consecutive_failures = 0
+            self._mt5_connected = True
+            self._symbol_cache.clear()  # force re-resolve after reconnect
+            log.info("MT5 reconnected successfully.")
+            return True
+        log.warning("MT5 reconnection failed.")
+        self._mt5_connected = False
+        return False
+
+    def check_mt5_health(self) -> bool:
+        """Return True if MT5 is responding, False otherwise."""
+        info = mt5.account_info()
+        if info is not None:
+            if not self._mt5_connected:
+                log.info("MT5 connection restored.")
+                self._mt5_connected = True
+                self._mt5_consecutive_failures = 0
+            return True
+        self._mt5_connected = False
+        return False
 
     def find_mt5_symbol(self, name: str) -> Optional[str]:
         """Find the actual MT5 symbol name for a given name.
@@ -214,7 +247,15 @@ class SignalMonitor:
 
     async def start_telegram(self) -> None:
         """Create and start the Telethon client."""
-        self.client = TelegramClient("signal_notify_session", API_ID, API_HASH)
+        self.client = TelegramClient(
+            "signal_notify_session",
+            API_ID,
+            API_HASH,
+            connection_retries=10,
+            retry_delay=5,
+            auto_reconnect=True,
+            request_retries=5,
+        )
         await self.client.start()
         me = await self.client.get_me()
         log.info("Telegram logged in as %s (id=%s)", me.first_name, me.id)
@@ -369,7 +410,7 @@ class SignalMonitor:
 
     async def send_hit_notification(self, signal: Signal, current_price: float) -> None:
         """Send a Telegram message to the channel that the target price was hit."""
-        if not self.client:
+        if not self.client or not self.client.is_connected():
             return
         text = (
             f"🎯 **PRICE HIT!**\n\n"
@@ -393,7 +434,7 @@ class SignalMonitor:
         self, signal: Signal, current_price: float, milestone: int, pips: float
     ) -> None:
         """Send a Telegram notification when price is near the target."""
-        if not self.client:
+        if not self.client or not self.client.is_connected():
             return
         text = (
             f"📍 **{milestone} pips away!**\n\n"
@@ -417,7 +458,7 @@ class SignalMonitor:
 
     async def _send_expiry_notification(self, signal: Signal) -> None:
         """Send a Telegram message when a signal is removed due to 24h expiry."""
-        if not self.client:
+        if not self.client or not self.client.is_connected():
             return
         age_hours = (time.time() - signal.created_at) / 3600
         text = (
@@ -442,7 +483,7 @@ class SignalMonitor:
 
     async def _verify_messages_exist(self) -> None:
         """Periodically verify that signal messages have not been deleted."""
-        if not self.client:
+        if not self.client or not self.client.is_connected():
             return
         to_remove = []
         for key, sig in list(self.active_signals.items()):
@@ -473,8 +514,19 @@ class SignalMonitor:
 
     async def _price_loop(self) -> None:
         """Check MT5 prices against active signals."""
+        MT5_FAILURE_THRESHOLD = 5  # consecutive no-data cycles before reconnect
         while self._running:
+            # ── MT5 health gate ──
+            if not self._mt5_connected or not self.check_mt5_health():
+                self._mt5_consecutive_failures += 1
+                if self._mt5_consecutive_failures >= MT5_FAILURE_THRESHOLD:
+                    self.reconnect_mt5()
+                    self._mt5_consecutive_failures = 0
+                await asyncio.sleep(PRICE_CHECK_INTERVAL)
+                continue
+
             hit_keys: list[Tuple[Tuple[int, int], float]] = []
+            got_any_tick = False
 
             for key, sig in list(self.active_signals.items()):
                 actual_symbol = self.find_mt5_symbol(sig.symbol)
@@ -485,6 +537,7 @@ class SignalMonitor:
                 if tick is None:
                     log.debug("No tick data for %s (%s)", sig.symbol, actual_symbol)
                     continue
+                got_any_tick = True
 
                 bid = tick.bid
                 target = sig.target_price
@@ -539,6 +592,15 @@ class SignalMonitor:
                     sig = self.active_signals.pop(key)
                     await self.send_hit_notification(sig, current_price)
 
+            # Track consecutive cycles with no tick data (possible MT5 disconnect)
+            if self.active_signals and not got_any_tick:
+                self._mt5_consecutive_failures += 1
+                if self._mt5_consecutive_failures >= MT5_FAILURE_THRESHOLD:
+                    log.warning("No MT5 tick data for %d cycles, reconnecting\u2026", MT5_FAILURE_THRESHOLD)
+                    self.reconnect_mt5()
+            else:
+                self._mt5_consecutive_failures = 0
+
             await asyncio.sleep(PRICE_CHECK_INTERVAL)
 
     async def _message_check_loop(self) -> None:
@@ -591,28 +653,60 @@ class SignalMonitor:
         if not self.init_mt5():
             log.error("Cannot start without MT5 connection.")
             return
+        self._mt5_connected = True
 
-        # Connect Telegram
-        await self.start_telegram()
-        if not self._resolved_channels:
-            mt5.shutdown()
-            return
-
-        self._running = True
-        log.info("SignalNotify is running. Press Ctrl+C to stop.")
+        reconnect_delay = RECONNECT_BASE_DELAY
 
         try:
-            await asyncio.gather(
-                self._price_loop(),
-                self._message_check_loop(),
-                self._expiry_loop(),
-                self._status_loop(),
-                self.client.run_until_disconnected(),
-            )
+            while True:
+                # (Re)connect Telegram
+                try:
+                    await self.start_telegram()
+                except Exception as exc:
+                    log.error("Telegram connection failed: %s", exc)
+                    log.info("Retrying in %.0f seconds…", reconnect_delay)
+                    await asyncio.sleep(reconnect_delay)
+                    reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+                    continue
+
+                if not self._resolved_channels:
+                    mt5.shutdown()
+                    return
+
+                self._running = True
+                reconnect_delay = RECONNECT_BASE_DELAY  # reset on success
+                log.info("SignalNotify is running. Press Ctrl+C to stop.")
+
+                try:
+                    await asyncio.gather(
+                        self._price_loop(),
+                        self._message_check_loop(),
+                        self._expiry_loop(),
+                        self._status_loop(),
+                        self.client.run_until_disconnected(),
+                    )
+                except ConnectionError as exc:
+                    log.warning("Telegram connection lost: %s", exc)
+                except OSError as exc:
+                    log.warning("Network error: %s", exc)
+                finally:
+                    self._running = False
+                    if self.client and self.client.is_connected():
+                        await self.client.disconnect()
+
+                log.info(
+                    "Connection ended. Reconnecting in %.0f seconds…",
+                    reconnect_delay,
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+
         except (KeyboardInterrupt, asyncio.CancelledError):
             log.info("Shutting down…")
         finally:
             self._running = False
+            if self.client and self.client.is_connected():
+                await self.client.disconnect()
             mt5.shutdown()
             log.info("MT5 disconnected. Bye!")
 
