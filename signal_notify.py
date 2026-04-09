@@ -7,13 +7,16 @@ Stops monitoring if the original signal message is deleted.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
+import aiohttp
 import MetaTrader5 as mt5
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -44,6 +47,11 @@ SIGNAL_MAX_AGE = float(os.getenv("SIGNAL_MAX_AGE", str(24 * 60 * 60)))  # 24 hou
 EXPIRY_CHECK_INTERVAL = float(os.getenv("EXPIRY_CHECK_INTERVAL", "60"))  # check every minute
 RECONNECT_BASE_DELAY = float(os.getenv("RECONNECT_BASE_DELAY", "10"))  # initial delay before reconnect
 RECONNECT_MAX_DELAY = float(os.getenv("RECONNECT_MAX_DELAY", "300"))  # max delay between reconnects
+SIGNALS_FILE = Path(os.getenv("SIGNALS_FILE", "active_signals.json"))
+
+NEWS_CHECK_INTERVAL = float(os.getenv("NEWS_CHECK_INTERVAL", "300"))  # check calendar every 5 min
+NEWS_ALERT_MINUTES = int(os.getenv("NEWS_ALERT_MINUTES", "15"))  # notify N min before event
+FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # ── Signal pattern ───────────────────────────────────────────────────────────
 # Matches patterns like:  GOLD@5000  |  EURUSD@1.08550  |  XAUUSD @ 2050.50
@@ -86,6 +94,35 @@ class Signal:
         """Unique key: (channel_id, message_id)."""
         return (self.channel_id, self.message_id)
 
+    def to_dict(self) -> dict:
+        return {
+            "symbol": self.symbol,
+            "target_price": self.target_price,
+            "channel_id": self.channel_id,
+            "message_id": self.message_id,
+            "raw_text": self.raw_text,
+            "initial_price": self.initial_price,
+            "pip_size": self.pip_size,
+            "notified_milestones": sorted(self.notified_milestones),
+            "previous_price": self.previous_price,
+            "created_at": self.created_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Signal":
+        return cls(
+            symbol=d["symbol"],
+            target_price=d["target_price"],
+            channel_id=d["channel_id"],
+            message_id=d["message_id"],
+            raw_text=d["raw_text"],
+            initial_price=d.get("initial_price"),
+            pip_size=d.get("pip_size", 0.0001),
+            notified_milestones=set(d.get("notified_milestones", [])),
+            previous_price=d.get("previous_price"),
+            created_at=d.get("created_at", time.time()),
+        )
+
     def pips_away(self, current_price: float) -> float:
         """Calculate how many pips the current price is from the target."""
         return abs(current_price - self.target_price) / self.pip_size
@@ -102,6 +139,35 @@ class SignalMonitor:
         self._symbol_cache: Dict[str, str] = {}  # requested name → actual MT5 name
         self._mt5_consecutive_failures = 0
         self._mt5_connected = False
+        self._notified_news: Set[str] = set()  # event IDs already alerted
+
+    # ── Persistence ──────────────────────────────────────────────────────
+
+    def _save_signals(self) -> None:
+        """Persist active signals to disk."""
+        data = [sig.to_dict() for sig in self.active_signals.values()]
+        try:
+            SIGNALS_FILE.write_text(json.dumps(data, indent=2))
+        except Exception as exc:
+            log.error("Failed to save signals: %s", exc)
+
+    def _load_signals(self) -> None:
+        """Restore signals from disk."""
+        if not SIGNALS_FILE.exists():
+            return
+        try:
+            data: List[dict] = json.loads(SIGNALS_FILE.read_text())
+            now = time.time()
+            for d in data:
+                sig = Signal.from_dict(d)
+                if now - sig.created_at >= SIGNAL_MAX_AGE:
+                    log.info("Skipping expired saved signal: %s @ %.5f", sig.symbol, sig.target_price)
+                    continue
+                self.active_signals[sig.key] = sig
+            if self.active_signals:
+                log.info("Restored %d signal(s) from disk.", len(self.active_signals))
+        except Exception as exc:
+            log.error("Failed to load signals: %s", exc)
 
     # ── MT5 ──────────────────────────────────────────────────────────────
 
@@ -357,6 +423,7 @@ class SignalMonitor:
                 direction = "● already at target"
 
         self.active_signals[signal.key] = signal
+        self._save_signals()
         log.info(
             "NEW SIGNAL: %s @ %.5f  (current: %s, pip=%.5f)  %s  (channel=%s msg=%s)",
             symbol,
@@ -407,6 +474,8 @@ class SignalMonitor:
                 sig.channel_id,
                 sig.message_id,
             )
+        if removed:
+            self._save_signals()
 
     async def send_hit_notification(self, signal: Signal, current_price: float) -> None:
         """Send a Telegram message to the channel that the target price was hit."""
@@ -509,6 +578,8 @@ class SignalMonitor:
                 sig.channel_id,
                 sig.message_id,
             )
+        if to_remove:
+            self._save_signals()
 
     # ── Main loops ───────────────────────────────────────────────────────
 
@@ -591,6 +662,8 @@ class SignalMonitor:
                 if key in self.active_signals:
                     sig = self.active_signals.pop(key)
                     await self.send_hit_notification(sig, current_price)
+            if hit_keys:
+                self._save_signals()
 
             # Track consecutive cycles with no tick data (possible MT5 disconnect)
             if self.active_signals and not got_any_tick:
@@ -629,6 +702,90 @@ class SignalMonitor:
                     sig.message_id,
                 )
                 await self._send_expiry_notification(sig)
+            if expired_keys:
+                self._save_signals()
+
+    # ── ForexFactory News ─────────────────────────────────────────────────
+
+    async def _fetch_ff_calendar(self) -> List[dict]:
+        """Fetch this week's ForexFactory calendar events."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(FF_CALENDAR_URL, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        log.warning("FF calendar HTTP %d", resp.status)
+                        return []
+                    return await resp.json(content_type=None)
+        except Exception as exc:
+            log.warning("Failed to fetch FF calendar: %s", exc)
+            return []
+
+    async def _broadcast_to_channels(self, text: str) -> None:
+        """Send a message to all resolved Telegram channels."""
+        if not self.client or not self.client.is_connected():
+            return
+        for channel_id in self._resolved_channels.values():
+            try:
+                await self.client.send_message(channel_id, text, parse_mode="md")
+            except Exception as exc:
+                log.error("Failed to send news alert to %s: %s", channel_id, exc)
+
+    async def _news_loop(self) -> None:
+        """Check ForexFactory calendar and alert before high-impact events."""
+        from datetime import datetime, timezone
+
+        while self._running:
+            events_data = await self._fetch_ff_calendar()
+            now = datetime.now(timezone.utc)
+
+            for ev in events_data:
+                impact = (ev.get("impact") or "").strip()
+                if impact not in ("High", "high", "Holiday"):
+                    continue
+
+                date_str = ev.get("date", "")
+                if not date_str:
+                    continue
+
+                # Parse the event datetime (format: "2026-04-09T12:30:00-04:00" or similar)
+                try:
+                    event_time = datetime.fromisoformat(date_str)
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    continue
+
+                # Unique key for this event
+                title = ev.get("title", "Unknown")
+                currency = ev.get("country", "")
+                event_key = f"{date_str}|{title}|{currency}"
+
+                if event_key in self._notified_news:
+                    continue
+
+                # Check if the event is within the alert window
+                minutes_until = (event_time - now).total_seconds() / 60
+                if 0 < minutes_until <= NEWS_ALERT_MINUTES:
+                    self._notified_news.add(event_key)
+                    forecast = ev.get("forecast", "")
+                    previous = ev.get("previous", "")
+
+                    text = (
+                        f"📰 **HIGH IMPACT NEWS in ~{int(minutes_until)} min!**\n\n"
+                        f"**Event:** {title}\n"
+                        f"**Currency:** {currency}\n"
+                        f"**Time:** {event_time.strftime('%H:%M UTC')}\n"
+                        f"**Forecast:** {forecast or 'N/A'}\n"
+                        f"**Previous:** {previous or 'N/A'}"
+                    )
+                    await self._broadcast_to_channels(text)
+                    log.info("News alert sent: %s (%s) in %d min", title, currency, int(minutes_until))
+
+                # Clean up old events from notified set
+                elif minutes_until < -60:
+                    self._notified_news.discard(event_key)
+
+            await asyncio.sleep(NEWS_CHECK_INTERVAL)
 
     async def _status_loop(self) -> None:
         """Log active signals count periodically."""
@@ -654,6 +811,9 @@ class SignalMonitor:
             log.error("Cannot start without MT5 connection.")
             return
         self._mt5_connected = True
+
+        # Restore signals saved before last shutdown
+        self._load_signals()
 
         reconnect_delay = RECONNECT_BASE_DELAY
 
@@ -682,6 +842,7 @@ class SignalMonitor:
                         self._price_loop(),
                         self._message_check_loop(),
                         self._expiry_loop(),
+                        self._news_loop(),
                         self._status_loop(),
                         self.client.run_until_disconnected(),
                     )
