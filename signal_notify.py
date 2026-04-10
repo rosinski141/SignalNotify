@@ -569,7 +569,9 @@ class SignalMonitor:
                 log.debug("Could not verify msg %s: %s", sig.message_id, exc)
 
         for key in to_remove:
-            sig = self.active_signals.pop(key)
+            sig = self.active_signals.pop(key, None)
+            if sig is None:
+                continue
             log.info(
                 "SIGNAL REMOVED (message no longer exists): %s @ %.5f  "
                 "(channel=%s msg=%s)",
